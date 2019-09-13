@@ -1,4 +1,5 @@
 # Hand Tracker
+[![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/wolterlw/hand_tracking/master)
 
 Simple Python wrapper for Google's [Mediapipe Hand Tracking](https://github.com/google/mediapipe/blob/master/mediapipe/docs/hand_tracking_mobile_gpu.md) pipeline.
 
