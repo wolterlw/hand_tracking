@@ -1,5 +1,6 @@
 # Hand Tracker
 [![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/wolterlw/hand_tracking/master)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/wolterlw/hand_tracking/blob/master/hand_model.ipynb)
 
 Simple Python wrapper for Google's [Mediapipe Hand Tracking](https://github.com/google/mediapipe/blob/master/mediapipe/docs/hand_tracking_mobile_gpu.md) pipeline.
 
