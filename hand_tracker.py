@@ -18,10 +18,14 @@ class HandTracker():
     Examples::
         >>> det = HandTracker(path1, path2, path3)
         >>> input_img = np.random.randint(0,255, 256*256*3).reshape(256,256,3)
-        >>> keypoints = det(input_img)
+        >>> keypoints, bbox = det(input_img)
     """
 
-    def __init__(self, palm_model, joint_model, anchors_path):
+    def __init__(self, palm_model, joint_model, anchors_path,
+                box_enlarge=1.5, box_shift=0.2):
+        self.box_shift = box_shift
+        self.box_enlarge = box_enlarge
+
         self.interp_palm = tf.lite.Interpreter(palm_model)
         self.interp_palm.allocate_tensors()
         self.interp_joint = tf.lite.Interpreter(joint_model)
@@ -32,6 +36,7 @@ class HandTracker():
             self.anchors = np.r_[
                 [x for x in csv.reader(csv_f, quoting=csv.QUOTE_NONNUMERIC)]
             ]
+        # reading tflite model paramteres
         output_details = self.interp_palm.get_output_details()
         input_details = self.interp_palm.get_input_details()
         
@@ -45,15 +50,21 @@ class HandTracker():
         # 90° rotation matrix used to create the alignment trianlge        
         self.R90 = np.r_[[[0,1],[-1,0]]]
 
-        # trianlge target coordinates used to move the detected hand into
-        # the right position
-        self.target_triangle = np.float32([
+        # trianlge target coordinates used to move the detected hand
+        # into the right position
+        self._target_triangle = np.float32([
                         [128, 128],
-                        [128, 0],
-                        [0, 128]
+                        [128,   0],
+                        [  0, 128]
+                    ])
+        self._target_box = np.float32([
+                        [  0,   0, 1],
+                        [256,   0, 1],
+                        [256, 256, 1],
+                        [  0, 256, 1],
                     ])
     
-    def _getTriangle(self, kp0, kp2, dist=1):
+    def _get_triangle(self, kp0, kp2, dist=1):
         """get a triangle used to calculate Affine transformation matrix"""
 
         dir_v = kp2 - kp0
@@ -61,6 +72,17 @@ class HandTracker():
 
         dir_v_r = dir_v @ self.R90.T
         return np.float32([kp2, kp2+dir_v*dist, kp2 + dir_v_r*dist])
+
+    @staticmethod
+    def _triangle_to_bbox(source):
+        # plain old vector arithmetics
+        bbox = np.c_[
+            [source[2] - source[0] + source[1]],
+            [source[1] + source[0] - source[2]],
+            [3 * source[0] - source[1] - source[2]],
+            [source[2] - source[1] + source[0]],
+        ].reshape(-1,2)
+        return bbox
     
     @staticmethod
     def _im_normalize(img):
@@ -76,65 +98,92 @@ class HandTracker():
     def _pad1(x):
         return np.pad(x, ((0,0),(0,1)), constant_values=1, mode='constant')
     
-        
-    def _predict_palm(self, img_norm):
-        self.interp_palm.set_tensor(self.in_idx, img_norm[None])
-        self.interp_palm.invoke()
-
-        out_reg = self.interp_palm.get_tensor(self.out_reg_idx)[0]
-        out_clf = self.interp_palm.get_tensor(self.out_clf_idx)[0,:,0]
-        
-        return out_reg, out_clf
     
-    def _predict_joints(self, img_norm):
-        self.interp_joint.set_tensor(self.in_idx_joint, img_norm.reshape(1,256,256,3))
+    def predict_joints(self, img_norm):
+        self.interp_joint.set_tensor(
+            self.in_idx_joint, img_norm.reshape(1,256,256,3))
         self.interp_joint.invoke()
 
         joints = self.interp_joint.get_tensor(self.out_idx_joint)
         return joints.reshape(-1,2)
 
-    def __call__(self, img):
+    def detect_hand(self, img_norm):
+        assert -1 <= img_norm.min() and img_norm.max() <= 1,\
+        "img_norm should be in range [-1, 1]"
+        assert img_norm.shape == (256, 256, 3),\
+        "img_norm shape must be (256, 256, 3)"
+
+        # predict hand location and 7 initial landmarks
+        self.interp_palm.set_tensor(self.in_idx, img_norm[None])
+        self.interp_palm.invoke()
+
+        out_reg = self.interp_palm.get_tensor(self.out_reg_idx)[0]
+        out_clf = self.interp_palm.get_tensor(self.out_clf_idx)[0,:,0]
+
+        # finding the best prediction
+        # TODO: replace it with non-max suppression
+        detecion_mask = self._sigm(out_clf) > 0.7
+        candidate_detect = out_reg[detecion_mask]
+        candidate_anchors = self.anchors[detecion_mask]
+
+        if candidate_detect.shape[0] == 0:
+            print("No hands found")
+            return None, None, None
+        # picking the widest suggestion while NMS is not implemented
+        max_idx = np.argmax(candidate_detect[:, 3])
+
+        # bounding box offsets, width and height
+        dx,dy,w,h = candidate_detect[max_idx, :4]
+        center_wo_offst = candidate_anchors[max_idx,:2] * 256
+        
+        # 7 initial keypoints
+        keypoints = center_wo_offst + candidate_detect[max_idx,4:].reshape(-1,2)
+        side = max(w,h) * self.box_enlarge
+        
+        # now we need to move and rotate the detected hand for it to occupy a
+        # 256x256 square
+        # line from wrist keypoint to middle finger keypoint
+        # should point straight up
+        # TODO: replace triangle with the bbox directly
+        source = self._get_triangle(keypoints[0], keypoints[2], side)
+        source -= (keypoints[0] - keypoints[2]) * self.box_shift
+        return source, keypoints
+
+    def preprocess_img(self, img):
         # fit the image into a 256x256 square
         shape = np.r_[img.shape]
         pad = (shape.max() - shape[:2]).astype('uint32') // 2
-        img_pad = np.pad(img, ((pad[0],pad[0]), (pad[1],pad[1]), (0,0)), mode='constant')
+        img_pad = np.pad(
+            img,
+            ((pad[0],pad[0]), (pad[1],pad[1]), (0,0)),
+            mode='constant')
         img_small = cv2.resize(img_pad, (256, 256))
         img_small = np.ascontiguousarray(img_small)
         
         img_norm = self._im_normalize(img_small)
+        return img_pad, img_norm, pad
 
-        # predict hand location and 7 initial landmarks
-        out_reg, out_clf = self._predict_palm(img_norm)
+
+    def __call__(self, img):
+        img_pad, img_norm, pad = self.preprocess_img(img)
         
-        max_idx = np.argmax(out_clf)
-        confidence = self._sigm(out_clf[max_idx])
-        if confidence < 0.7:
-            print("no hand found")
-            return
-        
-        dx,dy,w,h = out_reg[max_idx, :4] # bounding box offsets, width and height
-        center_wo_offset = self.anchors[max_idx,:2] * 256
-        
-        # 7 initial keypoints
-        keypoints = center_wo_offset + out_reg[max_idx,4:].reshape(-1,2)
-        side = max(w,h)*1.3
-        
-        # now we need to move and rotate the detected hand for it to occupy a 256x256 square
-        # line from wrist keypoint to middle finger keypoint should point straight up
-        source = self._getTriangle(keypoints[0], keypoints[2], side)
-        
-        scale = max(shape) / 256
-        
+        source, keypoints = self.detect_hand(img_norm)
+        if source is None:
+            return None, None
+
+        # calculating transformation from img_pad coords
+        # to img_landmark coords (cropped hand image)
+        scale = max(img.shape) / 256
         Mtr = cv2.getAffineTransform(
             source * scale,
-            self.target_triangle
+            self._target_triangle
         )
         
         img_landmark = cv2.warpAffine(
             self._im_normalize(img_pad), Mtr, (256,256)
         )
         
-        joints = self._predict_joints(img_landmark)
+        joints = self.predict_joints(img_landmark)
         
         # adding the [0,0,1] row to make the matrix square
         Mtr = self._pad1(Mtr.T).T
@@ -144,6 +193,8 @@ class HandTracker():
 
         # projecting keypoints back into original image coordinate space
         kp_orig = (self._pad1(joints) @ Minv.T)[:,:2]
+        box_orig = (self._target_box @ Minv.T)[:,:2]
         kp_orig -= pad[::-1]
+        box_orig -= pad[::-1]
         
-        return kp_orig
+        return kp_orig, box_orig
