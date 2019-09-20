@@ -38,7 +38,15 @@ After you've successfully executed the build command you end up with a binary `.
 
 Congrats, now you know how to clumsily add custom operations to tflite.
 
+This build process is quite curude and hasty so you might run into some issues, especially on other platforms.  
+For a more principled approach look [here](https://github.com/wolterlw/hand_tracking/issues/2#issuecomment-532514675) (big thanks to [@imLogM](https://github.com/imLogM))
+
 Alternatively here's a [link](https://www.dropbox.com/s/07p84k7q4kxwc02/tensorflow-1.13.2-cp37-cp37m-linux_x86_64.whl?dl=0) to a wheel built by me on a Ubuntu 18.04 laptop.
+
+### Anchors
+
+To get the SSD anchors I've written a C++ program that executes the `SsdAnchorsCalculator::GenerateAnchors` function from [this calculator](https://github.com/google/mediapipe/blob/master/mediapipe/calculators/tflite/ssd_anchors_calculator.cc).
+As there's no reason to modify provided anchors I do not include it into the repository, but you can find the script [here](https://gist.github.com/wolterlw/6f1ebc49230506f8e9ce5facc5251d4f)
 
 ## Acknowledgments
 
