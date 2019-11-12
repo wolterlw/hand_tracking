@@ -63,6 +63,7 @@ class HandTracker():
                         [256, 256, 1],
                         [  0, 256, 1],
                     ])
+        self.score = 0
     
     def _get_triangle(self, kp0, kp2, dist=1):
         """get a triangle used to calculate Affine transformation matrix"""
@@ -92,6 +93,8 @@ class HandTracker():
        
     @staticmethod
     def _sigm(x):
+        # x = x / np.abs(x).max() * 100
+        # x = np.clip(x, -50, 50)
         return 1 / (1 + np.exp(-x) )
     
     @staticmethod
@@ -105,6 +108,7 @@ class HandTracker():
         self.interp_joint.invoke()
 
         joints = self.interp_joint.get_tensor(self.out_idx_joint)
+        self.score = float(self.interp_joint.get_tensor(894))
         return joints.reshape(-1,2)
 
     def detect_hand(self, img_norm):
@@ -122,7 +126,7 @@ class HandTracker():
 
         # finding the best prediction
         # TODO: replace it with non-max suppression
-        detecion_mask = self._sigm(out_clf) > 0.7
+        detecion_mask = out_clf > 0.85
         candidate_detect = out_reg[detecion_mask]
         candidate_anchors = self.anchors[detecion_mask]
 
@@ -163,14 +167,59 @@ class HandTracker():
         img_norm = self._im_normalize(img_small)
         return img_pad, img_norm, pad
 
+    def process_frame(self, img, source=None):
+
+        if source is None:
+            print(f"detecting hand, last score {self.score:.3f}")
+            img_pad, img_norm, pad = self.preprocess_img(img)
+            scale = max(img.shape) / 256
+            try:
+                source, keypoints = self.detect_hand(img_norm)
+            except:
+                return None, None, None
+        else:
+            img_pad = img
+            pad = [0, 0]
+            scale = 1
+        
+
+        Mtr = cv2.getAffineTransform(
+            source * scale,
+            self._target_triangle
+        )
+
+        img_landmark = cv2.warpAffine(
+            self._im_normalize(img_pad), Mtr, (256,256)
+        )
+        
+        joints = self.predict_joints(img_landmark)
+        
+        # adding the [0,0,1] row to make the matrix square
+        Mtr = self._pad1(Mtr.T).T
+        Mtr[2,:2] = 0
+
+        Minv = np.linalg.inv(Mtr)
+
+        # projecting keypoints back into original image coordinate space
+        kp_orig = (self._pad1(joints) @ Minv.T)[:,:2]
+        box_orig = (self._target_box @ Minv.T)[:,:2]
+        kp_orig -= pad[::-1]
+        box_orig -= pad[::-1]
+
+        side_new = np.linalg.norm(kp_orig - kp_orig[9],axis=1).max()*1.3
+        source_new = self._get_triangle(kp_orig[0], kp_orig[9], side_new) 
+        
+        return kp_orig, box_orig, source_new
+
 
     def __call__(self, img):
         img_pad, img_norm, pad = self.preprocess_img(img)
         
-        source, keypoints = self.detect_hand(img_norm)
-        if source is None:
+        try:
+            source, keypoints = self.detect_hand(img_norm)
+        except:
             return None, None
-
+        
         # calculating transformation from img_pad coords
         # to img_landmark coords (cropped hand image)
         scale = max(img.shape) / 256
