@@ -64,26 +64,27 @@ class HandTracker():
                         [  0, 256, 1],
                     ])
         self.score = 0
-    
-    def _get_triangle(self, kp0, kp2, dist=1):
-        """get a triangle used to calculate Affine transformation matrix"""
-
-        dir_v = kp2 - kp0
-        dir_v /= np.linalg.norm(dir_v)
-
-        dir_v_r = dir_v @ self.R90.T
-        return np.float32([kp2, kp2+dir_v*dist, kp2 + dir_v_r*dist])
 
     @staticmethod
-    def _triangle_to_bbox(source):
-        # plain old vector arithmetics
-        bbox = np.c_[
-            [source[2] - source[0] + source[1]],
-            [source[1] + source[0] - source[2]],
-            [3 * source[0] - source[1] - source[2]],
-            [source[2] - source[1] + source[0]],
-        ].reshape(-1,2)
-        return bbox
+    def get_bbox(landmarks, height_width, scale=3):
+        hvec = landmarks[[1, 4]]
+
+        center = hvec[0]
+        half = max(height_width) * scale / 2
+        v1 = hvec[1] - hvec[0]
+        norm = np.linalg.norm(v1)
+        v1 = v1 / norm
+        v2 = np.r_[v1[1], -v1[0]]
+        
+        p0 = center + v2 * half - v1 * half
+        p1 = center + v2 * half + v1 * half
+        p2 = center - v2 * half + v1 * half
+        p3 = center - v2 * half - v1 * half
+    
+        return {'box': np.r_[[p0, p1, p2, p3]].astype('int'),
+         'center': center,
+         'size': half * 2
+        }
     
     @staticmethod
     def _im_normalize(img):
@@ -100,6 +101,11 @@ class HandTracker():
     @staticmethod
     def _pad1(x):
         return np.pad(x, ((0,0),(0,1)), constant_values=1, mode='constant')
+
+    @staticmethod
+    def agg_hand(hand):
+        idx = np.argmax(hand['score'])
+        return {k: v[idx] for k,v in hand.items()}
     
     
     def predict_joints(self, img_norm):
@@ -111,47 +117,51 @@ class HandTracker():
         self.score = float(self.interp_joint.get_tensor(894))
         return joints.reshape(-1,2)
 
-    def detect_hand(self, img_norm):
+    def detect_hand(self, img_norm, scale=5):
         assert -1 <= img_norm.min() and img_norm.max() <= 1,\
         "img_norm should be in range [-1, 1]"
         assert img_norm.shape == (256, 256, 3),\
         "img_norm shape must be (256, 256, 3)"
 
+
         # predict hand location and 7 initial landmarks
         self.interp_palm.set_tensor(self.in_idx, img_norm[None])
         self.interp_palm.invoke()
 
-        out_reg = self.interp_palm.get_tensor(self.out_reg_idx)[0]
-        out_clf = self.interp_palm.get_tensor(self.out_clf_idx)[0,:,0]
+        reg = self.interp_palm.get_tensor(self.out_reg_idx)[0]
+        clf = self.interp_palm.get_tensor(self.out_clf_idx).flatten(
+            ).astype('float32').round(1)
 
-        # finding the best prediction
-        # TODO: replace it with non-max suppression
-        detecion_mask = out_clf > 0.85
-        candidate_detect = out_reg[detecion_mask]
-        candidate_anchors = self.anchors[detecion_mask]
+        centers = self.anchors[clf > 0][:, :2] * 256
+        idx = np.lexsort((centers[:, 1], centers[:, 0]))
 
-        if candidate_detect.shape[0] == 0:
-            print("No hands found")
-            return None, None, None
-        # picking the widest suggestion while NMS is not implemented
-        max_idx = np.argmax(candidate_detect[:, 3])
+        centers = centers[idx]
+        dxdy = reg[clf > 0][:,:2][idx]
+        wh = reg[clf > 0][:, 2:4][idx]
+        landmarks = reg[clf > 0][:, 4:].reshape(-1, 7, 2)[idx]
+        max_size = wh.max()
 
-        # bounding box offsets, width and height
-        dx,dy,w,h = candidate_detect[max_idx, :4]
-        center_wo_offst = candidate_anchors[max_idx,:2] * 256
-        
-        # 7 initial keypoints
-        keypoints = center_wo_offst + candidate_detect[max_idx,4:].reshape(-1,2)
-        side = max(w,h) * self.box_enlarge
-        
-        # now we need to move and rotate the detected hand for it to occupy a
-        # 256x256 square
-        # line from wrist keypoint to middle finger keypoint
-        # should point straight up
-        # TODO: replace triangle with the bbox directly
-        source = self._get_triangle(keypoints[0], keypoints[2], side)
-        source -= (keypoints[0] - keypoints[2]) * self.box_shift
-        return source, keypoints
+        landmarks = centers[:, None, :] + landmarks
+        centers += dxdy[:, :2]
+
+        # nonperfect, but working sample of hand detection
+        split_idx = np.argwhere(np.linalg.norm(centers[:-1] - centers[1:], axis=1) > max_size).flatten()
+        if np.any(split_idx):
+            split_idx += 1
+
+        split_centers = np.split(centers, split_idx)
+        split_wh = np.split(wh, split_idx)
+        split_landmarks = np.split(landmarks, split_idx)
+        split_clf = np.split(clf[clf > 0], split_idx)
+
+        hands = []
+        for cnt, wh, lm, scr in zip(
+            split_centers, split_wh, split_landmarks, split_clf):
+            hands.append({'center': lm[:,1,:] * scale,
+                          'height_width': wh * scale,
+                          'landmarks': lm * scale,
+                          'score': scr})
+        return [self.agg_hand(h) for h in hands]
 
     def preprocess_img(self, img):
         # fit the image into a 256x256 square
@@ -167,58 +177,22 @@ class HandTracker():
         img_norm = self._im_normalize(img_small)
         return img_pad, img_norm, pad
 
-    def process_frame(self, img, source=None):
-
-        if source is None:
-            print(f"detecting hand, last score {self.score:.3f}")
-            img_pad, img_norm, pad = self.preprocess_img(img)
-            scale = max(img.shape) / 256
-            try:
-                source, keypoints = self.detect_hand(img_norm)
-            except:
-                return None, None, None
-        else:
-            img_pad = img
-            pad = [0, 0]
-            scale = 1
-        
-
-        Mtr = cv2.getAffineTransform(
-            source * scale,
-            self._target_triangle
-        )
-
-        img_landmark = cv2.warpAffine(
-            self._im_normalize(img_pad), Mtr, (256,256)
-        )
-        
-        joints = self.predict_joints(img_landmark)
-        
-        # adding the [0,0,1] row to make the matrix square
-        Mtr = self._pad1(Mtr.T).T
-        Mtr[2,:2] = 0
-
-        Minv = np.linalg.inv(Mtr)
-
-        # projecting keypoints back into original image coordinate space
-        kp_orig = (self._pad1(joints) @ Minv.T)[:,:2]
-        box_orig = (self._target_box @ Minv.T)[:,:2]
-        kp_orig -= pad[::-1]
-        box_orig -= pad[::-1]
-
-        side_new = np.linalg.norm(kp_orig - kp_orig[9],axis=1).max()*1.3
-        source_new = self._get_triangle(kp_orig[0], kp_orig[9], side_new) 
-        
-        return kp_orig, box_orig, source_new
-
-
-    def __call__(self, img):
+    def __call__(self, img, boxes=None):
         img_pad, img_norm, pad = self.preprocess_img(img)
+        scale = img_pad.shape[0] / img_norm.shape[0]
         
-        try:
-            source, keypoints = self.detect_hand(img_norm)
-        except:
-            return None, None
+        if boxes is None:
+            try:
+                hands = self.detect_hand(img_norm, scale=scale)
+            except:
+                return []
+            boxes = [self.get_bbox(h['landmarks'], h['height_width'])\
+                     for h in hands]
+
+        for rec in boxes:
+            rec['box'] -= pad[::-1]
+
+        return boxes 
         
         # calculating transformation from img_pad coords
         # to img_landmark coords (cropped hand image)
