@@ -7,7 +7,7 @@ sys.path.append(Path("..").resolve().as_posix())
 
 from utils.comp_vision import bokeh_viz
 
-palm_model_path = "./models/palm_detection.tflite"
+palm_model_path = "./models/palm_detection_without_custom_op.tflite"
 landmark_model_path = "./models/hand_landmark.tflite"
 anchors_path = "./data/anchors.csv" 
 
