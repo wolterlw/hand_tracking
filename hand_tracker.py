@@ -4,10 +4,6 @@ import numpy as np
 import tensorflow as tf
 from sklearn.cluster import DBSCAN
 
-"""
-HAND TRACKER WITHOUT ROTATION ESTIMATION AND JOINT DETECTION
-"""
-
 class HandTracker():
     r"""
     Class to use Google's Mediapipe HandTracking pipeline from Python.
@@ -23,7 +19,7 @@ class HandTracker():
     Examples::
         >>> det = HandTracker(path1, path2, path3)
         >>> input_img = np.random.randint(0,255, 256*256*3).reshape(256,256,3)
-        >>> keypoints, bbox = det(input_img)
+        >>> hands = det(input_img)
     """
 
     def __init__(self, palm_model, joint_model, anchors_path,
@@ -61,6 +57,10 @@ class HandTracker():
         ]).astype('float32')
 
     def reset(self):
+        """
+        resets hand tracking data. Should be used any time there's
+        a scene transition in a video.
+        """
         self.hands = np.zeros((0,7,2))
         self.sizes = np.zeros((0,1))
         self.dydx = np.zeros((0,2))
@@ -69,17 +69,6 @@ class HandTracker():
     @staticmethod
     def hand_dist(x,y):
         return np.linalg.norm(x - y, axis=-1).mean(axis=-1)
-
-#     @staticmethod
-#     def add_bbox(hand):
-#         center = hand['lm'][2]
-#         half = float(hand['size'] / 2)
-#         tl = center - [half, half]
-#         bl = center - [half, -half]
-#         tr = center - [-half, half]
-#         br = center + [half, half]
-#         hand['bbox'] = np.c_[[tl,bl,br,tr]]
-#         return hand
     
     @staticmethod
     def add_bbox(hand):
@@ -111,14 +100,15 @@ class HandTracker():
     
     @staticmethod
     def _im_normalize(img):
-         return np.ascontiguousarray(
+        """
+        normalize all values into [-1, 1]
+        """
+        return np.ascontiguousarray(
              2 * ((img / 255) - 0.5
         ).astype('float32'))
        
     @staticmethod
     def _sigm(x):
-        # x = x / np.abs(x).max() * 100
-        # x = np.clip(x, -50, 50)
         return 1 / (1 + np.exp(-x) )
     
     @staticmethod
@@ -127,11 +117,17 @@ class HandTracker():
 
     @staticmethod
     def agg_hand(hand):
-        idx = np.argmax(hand['score'])
+        """
+        method used to choose between multiple
+        hand detections in the same cluster
+        """
+        idx = np.argmax(hand['size']) # seems to work better than score
         return {k: v[idx] for k,v in hand.items()}
 
     def preprocess_img(self, img):
-        # fit the image into a 256x256 square
+        """
+        fit the image into a 256x256 square and normalizes it
+        """
         shape = np.r_[img.shape]
         pad = (shape.max() - shape[:2]).astype('uint32') // 2
         img_pad = np.pad(
@@ -145,6 +141,10 @@ class HandTracker():
         return img_pad, img_norm, pad
 
     def detect_hand(self, img_norm, scale=5, box_enlarge=2.5):
+        """
+        runs the palm detection model, decodes possible detections, clusters them
+        and aggregates detections in the same clusters
+        """
         assert -1 <= img_norm.min() and img_norm.max() <= 1,\
         "img_norm should be in range [-1, 1]"
         assert img_norm.shape == (256, 256, 3),\
@@ -195,6 +195,10 @@ class HandTracker():
         return [self.agg_hand(h) for h in hands]
 
     def track(self, hands):
+        """
+        Makes sure that hands are ordered consistently
+        between frames of a video and mitigates jitter.
+        """
         lm_new = np.c_[[x['lm'] for x in hands]]
         sizes = np.c_[[x['size'] for x in hands]]
 
@@ -249,6 +253,11 @@ class HandTracker():
         return self.hands.copy(), self.sizes.copy(), self.dydx.copy()
     
     def get_landmarks (self, img, hand):
+        """
+        crops the hand image according to the bounding box,
+        runs hand landmark detection models and projects
+        obtained coordinates onto the full-sized image
+        """
         source = hand['bbox'].astype('float32')
         
         Mtr = cv2.getAffineTransform(
@@ -272,6 +281,19 @@ class HandTracker():
         return hand
 
     def __call__(self, img, hands=None):
+        r"""
+        Method used to detect hand poses in individual images
+        and track hands in video frames.
+        Args:
+            img: image as a numpy array of shape (h,w,3)
+            hands: detected hands from previous time step
+        Ourput:
+            hands: ordered list of dictionaries containing
+                'bbox': bounding box of a hand
+                'joints': (21,2) array of hand joints
+            During normal operation hand ordering is preserved
+            between video frames
+        """
         img_pad, img_norm, pad = self.preprocess_img(img)
         scale = img_pad.shape[0] / img_norm.shape[0]
         
