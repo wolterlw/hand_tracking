@@ -2,6 +2,11 @@ import csv
 import cv2
 import numpy as np
 import tensorflow as tf
+from sklearn.cluster import DBSCAN
+
+"""
+HAND TRACKER WITHOUT ROTATION ESTIMATION AND JOINT DETECTION
+"""
 
 class HandTracker():
     r"""
@@ -22,14 +27,12 @@ class HandTracker():
     """
 
     def __init__(self, palm_model, joint_model, anchors_path,
-                box_enlarge=1.5, box_shift=0.2):
-        self.box_shift = box_shift
-        self.box_enlarge = box_enlarge
+                box_enlarge=3.3, box_shift=0.2):
 
         self.interp_palm = tf.lite.Interpreter(palm_model)
         self.interp_palm.allocate_tensors()
-        self.interp_joint = tf.lite.Interpreter(joint_model)
-        self.interp_joint.allocate_tensors()
+        self.interp_lm = tf.lite.Interpreter(joint_model)
+        self.interp_lm.allocate_tensors()
         
         # reading the SSD anchors
         with open(anchors_path, "r") as csv_f:
@@ -39,58 +42,78 @@ class HandTracker():
         # reading tflite model paramteres
         output_details = self.interp_palm.get_output_details()
         input_details = self.interp_palm.get_input_details()
+        output_details_lm = self.interp_lm.get_output_details()
         
         self.in_idx = input_details[0]['index']
         self.out_reg_idx = output_details[0]['index']
         self.out_clf_idx = output_details[1]['index']
         
-        self.in_idx_joint = self.interp_joint.get_input_details()[0]['index']
-        self.out_idx_joint = self.interp_joint.get_output_details()[0]['index']
+        self.lm_reg_idx = output_details_lm[0]['index']
+        
+        self.cluster = DBSCAN(eps=30, min_samples=1)
 
-        # 90° rotation matrix used to create the alignment trianlge        
-        self.R90 = np.r_[[[0,1],[-1,0]]]
-
-        # trianlge target coordinates used to move the detected hand
-        # into the right position
-        self._target_triangle = np.float32([
-                        [128, 128],
-                        [128,   0],
-                        [  0, 128]
-                    ])
+        self.reset()
         self._target_box = np.float32([
-                        [  0,   0, 1],
-                        [256,   0, 1],
-                        [256, 256, 1],
-                        [  0, 256, 1],
-                    ])
-        self.score = 0
+                        [  0, 256],
+                        [256, 256],
+                        [256,   0],
+                        [  0,   0],
+        ]).astype('float32')
+
+    def reset(self):
+        self.hands = np.zeros((0,7,2))
+        self.sizes = np.zeros((0,1))
+        self.dydx = np.zeros((0,2))
+        self.n_different = 0
 
     @staticmethod
-    def get_bbox(landmarks, height_width, scale=3):
-        hvec = landmarks[[1, 4]]
+    def hand_dist(x,y):
+        return np.linalg.norm(x - y, axis=-1).mean(axis=-1)
+
+#     @staticmethod
+#     def add_bbox(hand):
+#         center = hand['lm'][2]
+#         half = float(hand['size'] / 2)
+#         tl = center - [half, half]
+#         bl = center - [half, -half]
+#         tr = center - [-half, half]
+#         br = center + [half, half]
+#         hand['bbox'] = np.c_[[tl,bl,br,tr]]
+#         return hand
+    
+    @staticmethod
+    def add_bbox(hand):
+        if 'joints' in hand:
+            lm = hand['joints'][[0, 5, 9,13,17, 20]]
+        else:
+            lm = hand['lm']
+        hvec = lm[[1, 4]]
+        vv = lm[2] - lm[0]
 
         center = hvec[0]
-        half = max(height_width) * scale / 2
+        
+        half = max(hand['size']) / 2
         v1 = hvec[1] - hvec[0]
         norm = np.linalg.norm(v1)
         v1 = v1 / norm
         v2 = np.r_[v1[1], -v1[0]]
+        
+        if (v2 @ vv) > 0:
+            v2 = -v2
         
         p0 = center + v2 * half - v1 * half
         p1 = center + v2 * half + v1 * half
         p2 = center - v2 * half + v1 * half
         p3 = center - v2 * half - v1 * half
     
-        return {'box': np.r_[[p0, p1, p2, p3]].astype('int'),
-         'center': center,
-         'size': half * 2
-        }
+        hand['bbox'] = np.r_[[p0, p1, p2, p3]].astype('int')
+        return hand
     
     @staticmethod
     def _im_normalize(img):
          return np.ascontiguousarray(
-             2 * ((img / 255) - 0.5).astype('float32')
-         )
+             2 * ((img / 255) - 0.5
+        ).astype('float32'))
        
     @staticmethod
     def _sigm(x):
@@ -106,62 +129,6 @@ class HandTracker():
     def agg_hand(hand):
         idx = np.argmax(hand['score'])
         return {k: v[idx] for k,v in hand.items()}
-    
-    
-    def predict_joints(self, img_norm):
-        self.interp_joint.set_tensor(
-            self.in_idx_joint, img_norm.reshape(1,256,256,3))
-        self.interp_joint.invoke()
-
-        joints = self.interp_joint.get_tensor(self.out_idx_joint)
-        self.score = float(self.interp_joint.get_tensor(894))
-        return joints.reshape(-1,2)
-
-    def detect_hand(self, img_norm, scale=5):
-        assert -1 <= img_norm.min() and img_norm.max() <= 1,\
-        "img_norm should be in range [-1, 1]"
-        assert img_norm.shape == (256, 256, 3),\
-        "img_norm shape must be (256, 256, 3)"
-
-
-        # predict hand location and 7 initial landmarks
-        self.interp_palm.set_tensor(self.in_idx, img_norm[None])
-        self.interp_palm.invoke()
-
-        reg = self.interp_palm.get_tensor(self.out_reg_idx)[0]
-        clf = self.interp_palm.get_tensor(self.out_clf_idx).flatten(
-            ).astype('float32').round(1)
-
-        centers = self.anchors[clf > 0][:, :2] * 256
-        idx = np.lexsort((centers[:, 1], centers[:, 0]))
-
-        centers = centers[idx]
-        dxdy = reg[clf > 0][:,:2][idx]
-        wh = reg[clf > 0][:, 2:4][idx]
-        landmarks = reg[clf > 0][:, 4:].reshape(-1, 7, 2)[idx]
-        max_size = wh.max()
-
-        landmarks = centers[:, None, :] + landmarks
-        centers += dxdy[:, :2]
-
-        # nonperfect, but working sample of hand detection
-        split_idx = np.argwhere(np.linalg.norm(centers[:-1] - centers[1:], axis=1) > max_size).flatten()
-        if np.any(split_idx):
-            split_idx += 1
-
-        split_centers = np.split(centers, split_idx)
-        split_wh = np.split(wh, split_idx)
-        split_landmarks = np.split(landmarks, split_idx)
-        split_clf = np.split(clf[clf > 0], split_idx)
-
-        hands = []
-        for cnt, wh, lm, scr in zip(
-            split_centers, split_wh, split_landmarks, split_clf):
-            hands.append({'center': lm[:,1,:] * scale,
-                          'height_width': wh * scale,
-                          'landmarks': lm * scale,
-                          'score': scr})
-        return [self.agg_hand(h) for h in hands]
 
     def preprocess_img(self, img):
         # fit the image into a 256x256 square
@@ -177,47 +144,151 @@ class HandTracker():
         img_norm = self._im_normalize(img_small)
         return img_pad, img_norm, pad
 
-    def __call__(self, img, boxes=None):
+    def detect_hand(self, img_norm, scale=5, box_enlarge=2.5):
+        assert -1 <= img_norm.min() and img_norm.max() <= 1,\
+        "img_norm should be in range [-1, 1]"
+        assert img_norm.shape == (256, 256, 3),\
+        "img_norm shape must be (256, 256, 3)"
+
+
+        # predict hand location and 7 initial landmarks
+        self.interp_palm.set_tensor(self.in_idx, img_norm[None])
+        self.interp_palm.invoke()
+
+        reg = self.interp_palm.get_tensor(self.out_reg_idx)[0]
+        clf = self.interp_palm.get_tensor(self.out_clf_idx).flatten(
+            ).astype('float32').round(1)
+
+
+        centers = self.anchors[clf > 0][:, :2] * 256
+
+        dydx = reg[clf > 0][:,:2]
+        wh = reg[clf > 0][:, 2:4]
+        landmarks = reg[clf > 0][:, 4:].reshape(-1, 7, 2)
+        clf = clf[clf > 0]
+        max_size = wh.max()
+
+        landmarks = centers[:, None, :] + landmarks
+        centers += dydx[:, :2]
+
+        split_centers = []
+        split_wh = []
+        split_landmarks = []
+        split_clf = []
+
+        self.cluster.eps = max_size
+        clusters = self.cluster.fit_predict(centers)
+        for i in set(clusters):
+            split_centers.append(centers[clusters == i])
+            split_wh.append(wh[clusters == i])
+            split_landmarks.append(landmarks[clusters == i])
+            split_clf.append(clf[clusters == i])
+
+        hands = []
+        for cnt, wh, lm, scr in zip(
+            split_centers, split_wh, split_landmarks, split_clf):
+            hands.append({'center': lm[:,1,:] * scale,
+                          'size': wh.max(axis=-1) * box_enlarge * scale,
+                          'lm': lm * scale,
+                          'score': scr})
+
+        return [self.agg_hand(h) for h in hands]
+
+    def track(self, hands):
+        lm_new = np.c_[[x['lm'] for x in hands]]
+        sizes = np.c_[[x['size'] for x in hands]]
+
+        if len(self.hands) != len(lm_new):
+            self.n_different += 1
+        if self.n_different > 30:
+            self.reset()    
+
+        if len(lm_new) == 0:
+            for i in range(len(hands)):
+                self.hands[i] = self.hands[i] + self.dydx[i]
+            return self.hands.copy(), self.sizes.copy(), self.dydx.copy()    
+
+        assert lm_new.shape[1:] == (7,2), lm_new
+        
+        idx = list(range(len(self.hands))) # tracking which hands were updated
+        idx_new = list(range(len(lm_new))) 
+        
+
+        while idx_new:
+            if len(idx) == 0:
+                break
+
+            i = idx_new.pop(0)
+            sz = sizes[i]
+            h = lm_new[i]
+
+            dists = self.hand_dist(self.hands[idx], h)
+            
+            k = np.argmin(dists)
+            j = idx.pop(k) # updating tracked hand j
+
+            dydx = h[2] - self.hands[j][2]
+
+            if 10 < np.linalg.norm(dydx) < self.sizes[j]:
+                self.dydx[j] = 0.4*self.dydx[j] + 0.6*dydx
+
+                self.hands[j] = h
+            self.sizes[j] = 0.7*self.sizes[j] + 0.3*sz
+
+        # if there are hands that haven't been found, but we know
+        # they had large movement vectors before - just move them 
+        # as if by momentum
+        for i in idx:
+            self.hands[i] = self.hands[i] + self.dydx[i]
+
+        if idx_new:
+            self.hands = np.concatenate([self.hands, lm_new[idx_new]])
+            self.sizes = np.concatenate([self.sizes, sizes[idx_new]])
+            self.dydx = np.concatenate([self.dydx, np.zeros((len(idx_new), 2))])
+
+        return self.hands.copy(), self.sizes.copy(), self.dydx.copy()
+    
+    def get_landmarks (self, img, hand):
+        source = hand['bbox'].astype('float32')
+        
+        Mtr = cv2.getAffineTransform(
+            source[:3],
+            self._target_box[:3]
+        )
+        img_hand_np = cv2.warpAffine(img, Mtr, (256,256))
+        img_hand = self._im_normalize(img_hand_np)
+        
+        self.interp_lm.set_tensor(0, img_hand[None])
+        self.interp_lm.invoke()
+
+        reg = self.interp_lm.get_tensor(self.lm_reg_idx)[0].reshape(21,2)
+        
+        Mtr = self._pad1(Mtr.T).T
+        Mtr[2,:2] = 0
+        
+        Minv = np.linalg.inv(Mtr)
+        kp_orig = (self._pad1(reg) @ Minv.T)[:,:2]
+        hand['joints'] = kp_orig
+        return hand
+
+    def __call__(self, img, hands=None):
         img_pad, img_norm, pad = self.preprocess_img(img)
         scale = img_pad.shape[0] / img_norm.shape[0]
         
-        if boxes is None:
+        if hands is None:
             try:
                 hands = self.detect_hand(img_norm, scale=scale)
             except:
-                return []
-            boxes = [self.get_bbox(h['landmarks'], h['height_width'])\
-                     for h in hands]
+                hands = []
+            for rec in hands:
+                rec['lm'] -= pad[::-1]
 
-        for rec in boxes:
-            rec['box'] -= pad[::-1]
+            tracked = self.track(hands)
 
-        return boxes 
-        
-        # calculating transformation from img_pad coords
-        # to img_landmark coords (cropped hand image)
-        scale = max(img.shape) / 256
-        Mtr = cv2.getAffineTransform(
-            source * scale,
-            self._target_triangle
-        )
-        
-        img_landmark = cv2.warpAffine(
-            self._im_normalize(img_pad), Mtr, (256,256)
-        )
-        
-        joints = self.predict_joints(img_landmark)
-        
-        # adding the [0,0,1] row to make the matrix square
-        Mtr = self._pad1(Mtr.T).T
-        Mtr[2,:2] = 0
+            hands = [{'lm': x,'size': y, 'dydx': z} for x,y,z in zip(
+                tracked[0], tracked[1], tracked[2])]
 
-        Minv = np.linalg.inv(Mtr)
-
-        # projecting keypoints back into original image coordinate space
-        kp_orig = (self._pad1(joints) @ Minv.T)[:,:2]
-        box_orig = (self._target_box @ Minv.T)[:,:2]
-        kp_orig -= pad[::-1]
-        box_orig -= pad[::-1]
         
-        return kp_orig, box_orig
+        hands = [self.add_bbox(h) for h in hands]
+        hands = [self.get_landmarks(img, h) for h in hands]
+        return hands
